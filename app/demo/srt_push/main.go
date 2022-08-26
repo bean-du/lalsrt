@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"flag"
 	"fmt"
+	ts "github.com/asticode/go-astits"
 	"github.com/haivision/srtgo"
+	"github.com/q191201771/lal/pkg/aac"
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/logic"
-	"github.com/q191201771/lal/pkg/mpegts"
 	"github.com/q191201771/naza/pkg/bininfo"
 	"github.com/q191201771/naza/pkg/nazalog"
 	"log"
@@ -32,6 +35,11 @@ func main() {
 		option.VideoFormat = base.AvPacketStreamVideoFormatAnnexb
 	})
 
+	go func() {
+		err := lals.RunLoop()
+		nazalog.Infof("server manager done. err=%+v", err)
+	}()
+
 	options := make(map[string]string)
 	options["transtype"] = "live"
 
@@ -49,41 +57,57 @@ func main() {
 	}
 	defer s.Close()
 
-	buf := make([]byte, 2048)
+	reader := bufio.NewReader(s)
+
+	demuxer := ts.NewDemuxer(context.TODO(), reader)
+	pkt := base.AvPacket{}
+
+	videoTimestamp := float32(0)
+	audioTimestamp := float32(0)
+	isSet := false
 	for {
-		n, _ := s.Read(buf)
-		if n == 0 {
-			break
+		d, err := demuxer.NextData()
+		if err != nil {
+			if err == ts.ErrNoMorePackets {
+				break
+			}
+			log.Fatalf("%v", err)
 		}
 
-		packets := splitToTs(buf, n)
-
-		for _, p := range packets {
-			var pkt base.AvPacket
-			ts := mpegts.ParseTsPacketHeader(p[:4])
-			fmt.Printf(" pid: %x \n", ts.Pid)
-			switch ts.Pid {
-			case mpegts.PidPat:
-				log.Println("PAT packet")
-				start := 4
-				if ts.PayloadUnitStart == 1 {
-					start = 5
+		if d.PMT != nil {
+			for _, es := range d.PMT.ElementaryStreams {
+				switch es.StreamType {
+				case ts.StreamTypeH264Video:
+					pkt.PayloadType = base.AvPacketPtAvc
+				case ts.StreamTypeH265Video:
+					pkt.PayloadType = base.AvPacketPtHevc
+				case ts.StreamTypeAACAudio:
+					pkt.PayloadType = base.AvPacketPtAac
 				}
-				pat := mpegts.ParsePat(p[start:])
-				log.Println(pat.SearchPid(ts.Pid))
-
-			case mpegts.PidAudio:
-				log.Println("Audio packet")
-				_, n := mpegts.ParsePes(p[4:])
-				pkt.PayloadType = base.AvPacketPtAac
-				pkt.Payload = p[n+4:]
-			case mpegts.PidVideo:
-				log.Println("Video packet")
-				_, n := mpegts.ParsePes(p[4:])
-				pkt.PayloadType = base.AvPacketPtHevc
-				pkt.Payload = p[n+4:]
-
 			}
+		}
+
+		if d.PES != nil {
+			if d.PES.Header.IsVideoStream() {
+				videoTimestamp += float32(1000) / float32(15) // 1秒 / fps
+				pkt.Timestamp = int64(audioTimestamp)
+
+			} else {
+				audioTimestamp += float32(48000*4*2) / float32(8192*2)
+				pkt.Timestamp = int64(audioTimestamp)
+			}
+			pkt.Payload = d.PES.Data
+			pkt.Pts = d.PES.Header.OptionalHeader.PTS.Base
+
+			if !isSet && pkt.PayloadType == base.AvPacketPtAac {
+				asc, err := aac.MakeAscWithAdtsHeader(pkt.Payload[:aac.AdtsHeaderLength])
+				nazalog.Assert(nil, err)
+				// 3. 填入aac的audio specific config信息
+				session.FeedAudioSpecificConfig(asc)
+			}
+		}
+
+		if len(pkt.Payload) != 0 {
 			session.FeedAvPacket(pkt)
 		}
 	}
