@@ -8,12 +8,12 @@ import (
 	ts "github.com/asticode/go-astits"
 	"github.com/haivision/srtgo"
 	"github.com/q191201771/lal/pkg/aac"
+	"github.com/q191201771/lal/pkg/avc"
 	"github.com/q191201771/lal/pkg/base"
 	"github.com/q191201771/lal/pkg/logic"
 	"github.com/q191201771/naza/pkg/bininfo"
 	"github.com/q191201771/naza/pkg/nazalog"
 	"log"
-	"math"
 	"net"
 	"os"
 )
@@ -60,7 +60,11 @@ func main() {
 	reader := bufio.NewReader(s)
 
 	demuxer := ts.NewDemuxer(context.TODO(), reader)
-	pkt := base.AvPacket{}
+	pkts := make(map[uint16]*base.AvPacket)
+	pmts := map[uint16]*ts.PMTData{}
+	gotAllPMTs := false
+
+	var pat *ts.PATData
 
 	videoTimestamp := float32(0)
 	audioTimestamp := float32(0)
@@ -74,42 +78,96 @@ func main() {
 			log.Fatalf("%v", err)
 		}
 
+		if d.PAT != nil {
+			pat = d.PAT
+			gotAllPMTs = false
+			continue
+		}
+
 		if d.PMT != nil {
-			for _, es := range d.PMT.ElementaryStreams {
-				switch es.StreamType {
-				case ts.StreamTypeH264Video:
-					pkt.PayloadType = base.AvPacketPtAvc
-				case ts.StreamTypeH265Video:
-					pkt.PayloadType = base.AvPacketPtHevc
-				case ts.StreamTypeAACAudio:
-					pkt.PayloadType = base.AvPacketPtAac
+			pmts[d.PMT.ProgramNumber] = d.PMT
+
+			gotAllPMTs = true
+			for _, p := range pat.Programs {
+				_, ok := pmts[p.ProgramNumber]
+				if !ok {
+					gotAllPMTs = false
+					break
+				}
+			}
+
+			if !gotAllPMTs {
+				continue
+			}
+
+			for _, pmt := range pmts {
+				for _, es := range pmt.ElementaryStreams {
+					_, ok := pkts[es.ElementaryPID]
+					if ok {
+						continue
+					}
+					var payloadType base.AvPacketPt
+					switch es.StreamType {
+					case ts.StreamTypeH264Video:
+						payloadType = base.AvPacketPtAvc
+					case ts.StreamTypeH265Video:
+						payloadType = base.AvPacketPtHevc
+					case ts.StreamTypeAACAudio:
+						payloadType = base.AvPacketPtAac
+					}
+
+					pkts[es.ElementaryPID] = &base.AvPacket{
+						PayloadType: payloadType,
+					}
 				}
 			}
 		}
+		if !gotAllPMTs {
+			continue
+		}
 
 		if d.PES != nil {
+
+			pid := d.FirstPacket.Header.PID
+			pkt, ok := pkts[pid]
+			if !ok {
+				log.Printf("Got payload for unknown PID %d", pid)
+				continue
+			}
+
 			if d.PES.Header.IsVideoStream() {
-				videoTimestamp += float32(1000) / float32(15) // 1秒 / fps
-				pkt.Timestamp = int64(audioTimestamp)
+				pkt.Timestamp = int64(videoTimestamp)
+				pkt.Payload = d.PES.Data
+				pkt.Pts = d.PES.Header.OptionalHeader.PTS.Base
+
+				t := avc.ParseNaluType(d.PES.Data[0])
+				if t == avc.NaluTypeSps || t == avc.NaluTypePps || t == avc.NaluTypeSei {
+					// noop
+				} else {
+					videoTimestamp += float32(1000) / float32(25) // 1秒 / fps
+				}
 
 			} else {
-				audioTimestamp += float32(48000*4*2) / float32(8192*2)
 				pkt.Timestamp = int64(audioTimestamp)
-			}
-			pkt.Payload = d.PES.Data
-			pkt.Pts = d.PES.Header.OptionalHeader.PTS.Base
+				if d.PES.Header.PacketLength != 0 {
+					pkt.Payload = d.PES.Data
+					pkt.Pts = d.PES.Header.OptionalHeader.PTS.Base
+				}
 
-			if !isSet && pkt.PayloadType == base.AvPacketPtAac {
-				asc, err := aac.MakeAscWithAdtsHeader(pkt.Payload[:aac.AdtsHeaderLength])
-				nazalog.Assert(nil, err)
-				// 3. 填入aac的audio specific config信息
-				session.FeedAudioSpecificConfig(asc)
+				audioTimestamp += float32(44100*4*2) / float32(8192*2)
+				//audioTimestamp += float32(48000*4*2) / float32(8192*2)
+				//audioTimestamp += float32(1024/44100) * 1000
+
+				if !isSet && pkt.PayloadType == base.AvPacketPtAac {
+					asc, err := aac.MakeAscWithAdtsHeader(pkt.Payload[:aac.AdtsHeaderLength])
+					nazalog.Assert(nil, err)
+					session.FeedAudioSpecificConfig(asc)
+					isSet = true
+				}
 			}
+			session.FeedAvPacket(*pkt)
 		}
 
-		if len(pkt.Payload) != 0 {
-			session.FeedAvPacket(pkt)
-		}
 	}
 }
 
@@ -134,24 +192,30 @@ func parseFlag() string {
 	return *cf
 }
 
-func splitToTs(data []byte, n int) [][]byte {
-	var (
-		tsLen   = 188
-		average = int(math.Ceil(float64(n) / float64(tsLen)))
-		res     = make([][]byte, 0, average)
-	)
-	for i := 1; i <= average; i++ {
-		item := make([]byte, 0, 0)
-
-		if i == 1 {
-			item = data[0:tsLen]
-		} else {
-			start := i * tsLen
-			end := start + tsLen
-			item = data[start:end]
+func mergePackets(audioPackets, videoPackets []base.AvPacket) (packets []base.AvPacket) {
+	var i, j int
+	for {
+		// audio数组为空，将video的剩余数据取出，然后merge结束
+		if i == len(audioPackets) {
+			packets = append(packets, videoPackets[j:]...)
+			break
 		}
 
-		res = append(res, item)
+		//
+		if j == len(videoPackets) {
+			packets = append(packets, audioPackets[i:]...)
+			break
+		}
+
+		// 音频和视频都有数据，取时间戳小的
+		if audioPackets[i].Timestamp < videoPackets[j].Timestamp {
+			packets = append(packets, audioPackets[i])
+			i++
+		} else {
+			packets = append(packets, videoPackets[j])
+			j++
+		}
 	}
-	return res
+
+	return
 }
